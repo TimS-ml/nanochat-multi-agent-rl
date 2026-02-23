@@ -1,180 +1,165 @@
 """
-Tokenizing Distributed Data Loader for Pre-training
+Distributed dataloaders for pretraining.
 
-This module provides a streaming data loader that:
-1. Reads documents from Parquet files
-2. Tokenizes them on-the-fly using multithreading
-3. Yields batches of tokens for training
-4. Supports approximate resumption from checkpoints
-5. Works efficiently with distributed training (DDP)
+BOS-aligned bestfit:
+   - Every row starts with BOS token
+   - Documents packed using best-fit algorithm to minimize cropping
+   - When no document fits remaining space, crops a document to fill exactly
+   - 100% utilization (no padding), ~35% tokens cropped at T=2048
 
-Key design decisions:
-- Streaming: Doesn't load entire dataset into memory
-- On-the-fly tokenization: Amortizes tokenization cost over training
-- Stateful: Can save/resume position in dataset for checkpoint recovery
-- Distributed: Each rank processes different parts of the data
+Compared to the original tokenizing_distributed_data_loader:
+BOS-aligned loses ~35% of tokens to cropping, but ensures that
+there are fewer "confusing" tokens in the train/val batches as every token can
+now attend back to the BOS token and sees the full context of the document.
+
+Fallback to the original if you have very limited data AND long documents:
+https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
-from collections import deque
 
 import torch
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
-from nanochat.tokenizer import get_tokenizer
 
-def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
-    Stream pre-training data with on-the-fly tokenization and stateful resumption.
+    Infinite iterator over document batches (list of text strings) from parquet files.
 
-    This is a generator function that yields batches of tokenized data for training.
-    It supports approximate checkpoint resumption, which is useful for:
-    - Recovering from crashes during long training runs
-    - Continuing training after early stopping
-    - Resuming from checkpoints with loss spikes
+    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
+    where text_batch is a list of document strings, indices track position for resumption,
+    and epoch counts how many times we've cycled through the dataset (starts at 1).
+    """
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    Resumption strategy:
-    - APPROXIMATE, not perfect (trades complexity for simplicity)
-    - Won't repeat the same documents
-    - May skip a few documents at the resume point
-    - Perfect resumption is possible but would require much more complex state tracking
+    parquet_paths = list_parquet_files()
+    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
-    Args:
-        B: Batch size (number of sequences)
-        T: Sequence length (tokens per sequence)
-        split: "train" or "val" - which dataset split to use
-        tokenizer_threads: Number of threads for parallel tokenization (default: 4)
-        tokenizer_batch_size: Batch size for tokenization (default: 128)
-        device: Device to place tensors on (default: "cuda")
-        resume_state_dict: Optional state dict to resume from a previous position
-                          Should contain {'pq_idx': int, 'rg_idx': int}
+    resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
+    resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
+    resume_epoch = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
+    first_pass = True
+    pq_idx = resume_pq_idx
+    epoch = resume_epoch
 
-    Yields:
-        Tuple of (inputs, targets, state_dict):
-        - inputs: Tensor of shape (B, T) with input token IDs
-        - targets: Tensor of shape (B, T) with target token IDs (shifted by 1)
-        - state_dict: Current position in dataset for checkpoint saving
+    while True:  # iterate infinitely (multi-epoch)
+        pq_idx = resume_pq_idx if first_pass else 0
+        while pq_idx < len(parquet_paths):
+            filepath = parquet_paths[pq_idx]
+            pf = pq.ParquetFile(filepath)
+            # Start from resume point if resuming on same file, otherwise from DDP rank
+            if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
+                base_idx = resume_rg_idx // ddp_world_size
+                base_idx += 1  # advance by 1 so we don't repeat data after resuming
+                rg_idx = base_idx * ddp_world_size + ddp_rank
+                if rg_idx >= pf.num_row_groups:
+                    pq_idx += 1
+                    continue
+                resume_rg_idx = None  # only do this once
+            else:
+                rg_idx = ddp_rank
+            while rg_idx < pf.num_row_groups:
+                rg = pf.read_row_group(rg_idx)
+                batch = rg.column('text').to_pylist()
+                for i in range(0, len(batch), tokenizer_batch_size):
+                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
+                rg_idx += ddp_world_size
+            pq_idx += 1
+        first_pass = False
+        epoch += 1
 
-    Example:
-        >>> loader = tokenizing_distributed_data_loader_with_state(4, 512, "train")
-        >>> for inputs, targets, state in loader:
-        ...     loss = model(inputs, targets)
-        ...     # Save state with checkpoint for resumption
+
+def tokenizing_distributed_data_loader_with_state_bos_bestfit(
+    tokenizer, B, T, split,
+    tokenizer_threads=4, tokenizer_batch_size=128,
+    device="cuda", resume_state_dict=None,
+    buffer_size=1000
+):
+    """
+    BOS-aligned dataloader with Best-Fit Cropping.
+
+    Reduces token waste compared to simple greedy cropping by searching a buffer
+    for documents that fit well, while maintaining 100% utilization (no padding).
+
+    Algorithm for each row:
+    1. From buffered docs, pick the LARGEST doc that fits entirely
+    2. Repeat until no doc fits
+    3. When nothing fits, crop a doc to fill remaining space exactly
+
+    Key properties:
+    - Every row starts with BOS
+    - 100% utilization (no padding, every token is trained on)
+    - Approximately 35% of all tokens are discarded due to cropping
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
-    # Get distributed training info
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    row_capacity = T + 1
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    bos_token = tokenizer.get_bos_token_id()
+    doc_buffer = []
+    pq_idx, rg_idx, epoch = 0, 0, 1
 
-    def document_batches():
-        """
-        Infinite generator that yields batches of documents (text strings).
+    def refill_buffer():
+        nonlocal pq_idx, rg_idx, epoch
+        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        for tokens in token_lists:
+            doc_buffer.append(tokens)
 
-        Handles:
-        - Multi-epoch iteration (loops infinitely over dataset)
-        - Distributed data parallel (each rank gets different row groups)
-        - Resumption from a specific parquet file and row group
-        """
-        parquet_paths = list_parquet_files()
-        assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-        parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
-
-        # Determine starting position (for resumption or fresh start)
-        resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
-        resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
-        first_pass = True
-        pq_idx = resume_pq_idx # we kick off parquet files at the resume index (or by default just 0)
-        while True: # iterate infinitely (multi-epoch)
-            pq_idx = resume_pq_idx if first_pass else 0
-            while pq_idx < len(parquet_paths): # iterate over all parquet files
-                filepath = parquet_paths[pq_idx]
-                pf = pq.ParquetFile(filepath)
-                # Start from resume point if resuming on same file, otherwise from DDP rank
-                # I know this state resumption is a little bit tricky and a little bit hacky... sigh.
-                if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                    base_idx = resume_rg_idx // ddp_world_size # in units of ddp_world_size
-                    base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
-                    rg_idx = base_idx * ddp_world_size + ddp_rank
-                    if rg_idx >= pf.num_row_groups:
-                        pq_idx += 1
-                        continue
-                    resume_rg_idx = None # set to None as we only want to do this a single time
-                else:
-                    # Fresh start: each rank starts at its rank offset
-                    rg_idx = ddp_rank
-
-                # Process row groups assigned to this rank
-                while rg_idx < pf.num_row_groups:
-                    rg = pf.read_row_group(rg_idx)
-                    # Extract text documents from the 'text' column
-                    batch = rg.column('text').to_pylist()
-
-                    # Yield documents in smaller sub-batches for tokenization
-                    # This allows better parallelization in the tokenizer
-                    for i in range(0, len(batch), tokenizer_batch_size):
-                        yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx)
-                    rg_idx += ddp_world_size # advance to the next row group (in DDP)
-                pq_idx += 1 # advance to the next parquet file
-            first_pass = False
-    batches = document_batches()
-
-    # -------------------------------------------------------------------------
-    # Token batching: accumulate tokens and yield training batches
-    # -------------------------------------------------------------------------
-
-    # Calculate how many tokens we need per batch
-    needed_tokens = B * T + 1  # +1 because we need one extra for the shifted targets
-
-    # Initialize tokenizer
-    tokenizer = get_tokenizer()
-    bos_token = tokenizer.get_bos_token_id()  # Beginning-of-sequence token
-
-    # Token buffer: accumulates tokens from documents until we have enough for a batch
-    token_buffer = deque()  # Efficient for append-right, pop-left operations
+    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
+    # This gives us contiguous views and a single HtoD transfer
+    use_cuda = device == "cuda"
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
+    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
 
     while True:
-        # Accumulate tokens until we have enough for one batch
-        while len(token_buffer) < needed_tokens:
-            # Get next batch of documents
-            doc_batch, (pq_idx, rg_idx) = next(batches)
+        for row_idx in range(B):
+            pos = 0
+            while pos < row_capacity:
+                # Ensure buffer has documents
+                while len(doc_buffer) < buffer_size:
+                    refill_buffer()
 
-            # Tokenize the documents in parallel
-            token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+                remaining = row_capacity - pos
 
-            # Add all tokens to the buffer
-            for tokens in token_lists:
-                token_buffer.extend(tokens)
+                # Find largest doc that fits entirely
+                best_idx = -1
+                best_len = 0
+                for i, doc in enumerate(doc_buffer):
+                    doc_len = len(doc)
+                    if doc_len <= remaining and doc_len > best_len:
+                        best_idx = i
+                        best_len = doc_len
 
-        # Extract exactly the number of tokens we need
-        tokens = [token_buffer.popleft() for _ in range(needed_tokens)]
+                if best_idx >= 0:
+                    doc = doc_buffer.pop(best_idx)
+                    doc_len = len(doc)
+                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                    pos += doc_len
+                else:
+                    # No doc fits - crop shortest in buffer to fill remaining and minimize waste
+                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    doc = doc_buffer.pop(shortest_idx)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    pos += remaining
 
-        # Create tensor with optional CUDA optimizations
-        use_cuda_optimizations = device == "cuda"
-        scratch = torch.tensor(tokens, dtype=torch.long, pin_memory=use_cuda_optimizations)
+        # Copy to pinned CPU buffer, then single HtoD transfer
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
 
-        # Split into inputs and targets (targets are inputs shifted by 1)
-        # This is standard for language modeling: predict the next token
-        inputs_cpu = scratch[:-1]  # All tokens except the last
-        targets_cpu = scratch[1:]  # All tokens except the first
+        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
-        # Reshape from 1D to 2D (B, T) and transfer to device
-        inputs = inputs_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
-        targets = targets_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
-
-        # Save current position for checkpoint resumption
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx}
-
+        # Single HtoD copy into persistent GPU buffer and yield
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, state_dict
 
-def tokenizing_distributed_data_loader(*args, **kwargs):
-    """
-    Wrapper around tokenizing_distributed_data_loader_with_state that only yields
-    inputs and targets (without the state_dict).
-
-    This is convenient when you don't need checkpoint resumption.
-
-    Yields:
-        Tuple of (inputs, targets) where both are tensors of shape (B, T)
-    """
-    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state(*args, **kwargs):
+def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
+    """Helper that omits state_dict from yields."""
+    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets

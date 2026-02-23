@@ -53,12 +53,12 @@ GET /stats
     Returns: Worker pool statistics and GPU assignments
 
 Abuse Prevention:
-- Maximum 500 messages per request
-- Maximum 8000 characters per message
-- Maximum 32000 characters total conversation length
-- Temperature clamped to 0.0-2.0
-- Top-k clamped to 1-200
-- Max tokens clamped to 1-4096
+  - Maximum 500 messages per request
+  - Maximum 8000 characters per message
+  - Maximum 32000 characters total conversation length
+  - Temperature clamped to 0.0-2.0
+  - Top-k clamped to 0-200 (0 disables top-k filtering, using full vocabulary)
+  - Max tokens clamped to 1-4096
 """
 
 import argparse
@@ -86,14 +86,14 @@ MAX_MESSAGE_LENGTH = 8000
 MAX_TOTAL_CONVERSATION_LENGTH = 32000
 MIN_TEMPERATURE = 0.0
 MAX_TEMPERATURE = 2.0
-MIN_TOP_K = 1
+MIN_TOP_K = 0 # 0 disables top-k filtering, using full vocabulary
 MAX_TOP_K = 200
 MIN_MAX_TOKENS = 1
 MAX_MAX_TOKENS = 4096
 
 parser = argparse.ArgumentParser(description='NanoChat Web Server')
 parser.add_argument('-n', '--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
-parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|mid|rl")
+parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
 parser.add_argument('-t', '--temperature', type=float, default=0.8, help='Default temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Default top-k sampling parameter')
 parser.add_argument('-m', '--max-tokens', type=int, default=512, help='Default max tokens for generation')

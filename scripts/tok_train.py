@@ -1,42 +1,6 @@
 """
-Tokenizer Training Script
-
-This script trains a BPE (Byte Pair Encoding) tokenizer on the training data using
-the HuggingFace tokenizers library. The tokenizer is trained in the style of GPT-4's
-cl100k_base tokenizer.
-
-BPE tokenization:
-1. Start with all 256 possible bytes as the initial vocabulary
-2. Iteratively merge the most frequent pair of tokens to create new tokens
-3. Continue until reaching the target vocabulary size
-4. The result is a vocabulary that efficiently compresses common patterns
-
-The script also computes and caches token_bytes.pt, which maps each token ID to
-the number of bytes it represents. This enables efficient calculation of bits per
-byte (bpb) loss, which is invariant to vocabulary size.
-
-Key parameters:
-- vocab_size: Size of the final vocabulary (default 65536 = 2^16)
-- max_chars: Maximum characters to train on (default 10B)
-- doc_cap: Maximum characters per document (default 10K)
-
-The tokenizer will be saved to <base_dir>/tokenizer/ with:
-- tokenizer.json: Full tokenizer configuration
-- special_tokens.json: Special token definitions
-- token_bytes.pt: Tensor mapping token IDs to byte counts
-
-Usage examples:
-
-Default training (10B chars, vocab size 65536):
-    python -m scripts.tok_train
-
-Smaller vocabulary:
-    python -m scripts.tok_train --vocab_size=32768
-
-Train on less data (faster):
-    python -m scripts.tok_train --max_chars=1000000000  # 1B chars
-
-After training, use scripts.tok_eval to evaluate compression ratios.
+Train a tokenizer using our own BPE Tokenizer library.
+In the style of GPT-4 tokenizer.
 """
 import os
 import time
@@ -50,9 +14,9 @@ from nanochat.dataset import parquets_iter_batched
 # Parse command line arguments
 
 parser = argparse.ArgumentParser(description='Train a BPE tokenizer')
-parser.add_argument('--max_chars', type=int, default=10_000_000_000, help='Maximum characters to train on (default: 10B)')
-parser.add_argument('--doc_cap', type=int, default=10_000, help='Maximum characters per document (default: 10,000)')
-parser.add_argument('--vocab_size', type=int, default=65536, help='Vocabulary size (default: 65536 = 2^16)')
+parser.add_argument('--max-chars', type=int, default=2_000_000_000, help='Maximum characters to train on (default: 10B)')
+parser.add_argument('--doc-cap', type=int, default=10_000, help='Maximum characters per document (default: 10,000)')
+parser.add_argument('--vocab-size', type=int, default=32768, help='Vocabulary size (default: 32768 = 2^15)')
 args = parser.parse_args()
 print(f"max_chars: {args.max_chars:,}")
 print(f"doc_cap: {args.doc_cap:,}")
