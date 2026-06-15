@@ -24,9 +24,9 @@ What makes MMLU challenging:
 Format: 4-way multiple choice (A, B, C, D)
 Evaluation: Categorical - model must output the correct letter
 
-The dataset has two main subsets:
-- "all": Contains validation, dev, and test splits across all 57 subjects
-- "auxiliary_train": Additional training data (note: has quirky nested structure)
+The dataset exposes a single "all" subset across all 57 subjects, with splits:
+- "auxiliary_train": Additional training data
+- "validation" / "dev" / "test": Evaluation splits
 """
 
 from datasets import load_dataset
@@ -64,27 +64,19 @@ class MMLU(Task):
         Initialize the MMLU dataset.
 
         Args:
-            subset: Either "all" (evaluation) or "auxiliary_train" (training)
-            split: One of "train", "validation", "dev", or "test"
+            subset: Must be "all" (the only subset cais/mmlu exposes)
+            split: One of "auxiliary_train" (training), "validation", "dev", or "test"
             **kwargs: Additional arguments passed to parent Task
         """
         super().__init__(**kwargs)
-        assert subset in ["all", "auxiliary_train"], f"subset {subset} must be all|auxiliary_train"
-        assert split in ["train", "validation", "dev", "test"], f"split {split} must be train|validation|dev|test"
-        # auxiliary_train only has training data
-        if subset == "auxiliary_train":
-            assert split == "train", "auxiliary_train must be split into train"
-
+        # The cais/mmlu dataset only exposes the "all" subset; the training data
+        # lives in its "auxiliary_train" split (not a separate subset).
+        assert subset in ["all"], f"subset {subset} must be all"
+        assert split in ["auxiliary_train", "validation", "dev", "test"], f"split {split} must be auxiliary_train|validation|dev|test"
         self.subset = subset
         self.split = split
         # Load from HuggingFace and shuffle with fixed seed for reproducibility
         self.ds = load_dataset("cais/mmlu", subset, split=split).shuffle(seed=42)
-
-        # Handle quirky data structure in auxiliary_train subset
-        # For some reason, auxiliary_train wraps each row in an extra 'train' field
-        # We unwrap it here to get the actual question data
-        if subset == "auxiliary_train":
-            self.ds = self.ds.map(lambda row: row['train'], remove_columns=['train'])
 
     @property
     def eval_type(self):
