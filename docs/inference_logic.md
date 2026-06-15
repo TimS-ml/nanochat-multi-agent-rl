@@ -8,9 +8,9 @@ How nanochat generates text, from prompt to output tokens.
 
 Nanochat has two inference paths:
 
-1. **Naive generation** (`GPT.generate` in `nanochat/gpt.py:498`) - Simple autoregressive loop without KV cache. Batch size 1 only. Used for quick sampling during training evaluation.
+1. **Naive generation** (`GPT.generate` in `nanochat/gpt.py:560`) - Simple autoregressive loop without KV cache. Batch size 1 only. Used for quick sampling during training evaluation.
 
-2. **Engine generation** (`Engine.generate` in `nanochat/engine.py:171`) - Production inference with KV cache, batched multi-sample generation, and tool use (calculator). This is the primary inference path.
+2. **Engine generation** (`Engine.generate` in `nanochat/engine.py:176`) - Production inference with KV cache, batched multi-sample generation, and tool use (calculator). This is the primary inference path.
 
 ---
 
@@ -110,7 +110,7 @@ Each row in the batch has independent state:
 
 ### Calculator Safety
 
-The `use_calculator` function (`engine.py:47`) evaluates expressions with:
+The `use_calculator` function (`engine.py:46`) evaluates expressions with:
 - **Timeout**: 3 seconds max
 - **Sandboxed**: `eval()` with `__builtins__` stripped
 - **Restricted operations**: only math expressions and `.count()` string operations
@@ -119,7 +119,7 @@ The `use_calculator` function (`engine.py:47`) evaluates expressions with:
 
 ---
 
-## KV Cache Design (`nanochat/engine.py:83`)
+## KV Cache Design (`nanochat/engine.py:82`)
 
 The KV cache is designed for Flash Attention 3's `flash_attn_with_kvcache` API:
 
@@ -135,7 +135,7 @@ Key differences from FA2-style caches:
 - FA3 updates cache **in-place** during `flash_attn_with_kvcache`
 - Position tracked per batch element via `cache_seqlens`
 
-### Cache Flow in Attention (`gpt.py:142-157`)
+### Cache Flow in Attention (`gpt.py:154-167`)
 
 **Training** (no cache):
 ```python
@@ -159,29 +159,29 @@ if self.layer_idx == kv_cache.n_layers - 1:
 ## Sliding Window Attention
 
 Nanochat uses a configurable sliding window pattern (default: "SSSL"):
-- **S (Short)**: attend to `sequence_len / 2` tokens back
+- **S (Short)**: attend to ~`sequence_len / 4` tokens back (ceiled to the FA3 128-tile size, e.g. 2048 -> 512)
 - **L (Long)**: attend to full `sequence_len` context
 
 The pattern is tiled across layers, with the final layer always getting full context:
 ```
-Layer 0: S (1024 tokens)
-Layer 1: S (1024 tokens)
-Layer 2: S (1024 tokens)
+Layer 0: S (512 tokens)
+Layer 1: S (512 tokens)
+Layer 2: S (512 tokens)
 Layer 3: L (2048 tokens)  <- always full context
-Layer 4: S (1024 tokens)
+Layer 4: S (512 tokens)
 ...
 Layer N: L (2048 tokens)  <- final layer, always full context
 ```
 
 Window sizes are stored as `(left, right)` tuples for FA3:
 - `(-1, 0)` = full causal context (unlimited left)
-- `(1024, 0)` = sliding window of 1024 tokens
+- `(512, 0)` = sliding window of 512 tokens
 
 ---
 
 ## Sampling Strategy
 
-### `sample_next_token` (`engine.py:136`)
+### `sample_next_token` (`engine.py:141`)
 
 ```python
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -194,7 +194,7 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 The function operates on batched logits `(B, vocab_size)` and returns `(B, 1)`.
 
-### Logit Processing in Model (`gpt.py:483-487`)
+### Logit Processing in Model (`gpt.py:544-548`)
 
 Before sampling, logits go through:
 1. **Padding removal**: Slice to actual `vocab_size` (model pads to multiple of 64)

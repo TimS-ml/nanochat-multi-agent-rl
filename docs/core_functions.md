@@ -15,7 +15,7 @@ Model configuration with depth-based scaling. Key fields:
 - `n_embd` (768): embedding dimension (`depth * aspect_ratio`, where `aspect_ratio=64`)
 - `window_pattern` ("SSSL"): sliding window attention pattern tiled across layers
 
-### GPT (class, line 206)
+### GPT (class, line 216)
 Main GPT model. Notable architectural choices:
 - **RoPE** (no learned positional embeddings)
 - **QK norm** for training stability
@@ -23,59 +23,62 @@ Main GPT model. Notable architectural choices:
 - **ReLU^2** activation in MLP
 - **Logit softcapping** at 15 (smooth squashing via tanh)
 - **Learnable per-layer scalars**: `resid_lambdas` (residual scale) and `x0_lambdas` (input embedding skip connection)
+- **Smear gate** (`smear_gate` + `smear_lambda`): mixes the previous token's embedding into the current token for cheap bigram-like context
+- **Backout** (`backout_lambda`): subtracts a cached mid-layer residual before the final norm to remove low-level features
 - **Value Embeddings** (ResFormer-style): alternating layers get a separate value embedding from the input tokens
 - **Sliding window attention**: configurable SSSL pattern (3 short + 1 long, repeating)
 
 | Method | Line | Description |
 |--------|------|-------------|
-| `__init__` | 207 | Builds model on meta device (shapes only, no data) |
-| `init_weights` | 250 | Initializes all parameters: uniform for attn/MLP, normal for embeddings, zeros for output projections |
-| `_precompute_rotary_embeddings` | 304 | Computes cos/sin tables for RoPE (10X over-allocation for safety) |
-| `_compute_window_sizes` | 329 | Converts window pattern string ("SSSL") to per-layer (left, right) window size tuples |
-| `setup_optimizer` | 421 | Creates MuonAdamW optimizer with 6 param groups (Muon for matrices, AdamW for embeddings/scalars) |
-| `forward` | 461 | Full forward pass: embed -> norm -> blocks (with resid/x0 lambdas + value embeds) -> norm -> lm_head -> softcap -> loss or logits |
-| `generate` | 498 | Naive autoregressive generation (no KV cache, batch=1, streaming) |
-| `estimate_flops` | 365 | Estimates FLOPs/token accounting for sliding window attention |
-| `num_scaling_params` | 392 | Returns parameter counts by group for scaling law analysis |
+| `__init__` | 217 | Builds model on meta device (shapes only, no data) |
+| `init_weights` | 265 | Initializes all parameters: uniform for attn/MLP, normal for embeddings, zeros for output projections |
+| `_precompute_rotary_embeddings` | 331 | Computes cos/sin tables for RoPE (10X over-allocation for safety) |
+| `_compute_window_sizes` | 357 | Converts window pattern string ("SSSL") to per-layer (left, right) window size tuples |
+| `setup_optimizer` | 450 | Creates MuonAdamW optimizer with 6 param groups (Muon for matrices, AdamW for embeddings/scalars) |
+| `forward` | 492 | Full forward pass: embed -> norm -> blocks (with resid/x0 lambdas + value embeds) -> norm -> lm_head -> softcap -> loss or logits |
+| `generate` | 560 | Naive autoregressive generation (no KV cache, batch=1, streaming) |
+| `estimate_flops` | 393 | Estimates FLOPs/token accounting for sliding window attention |
+| `num_scaling_params` | 421 | Returns parameter counts by group for scaling law analysis |
 
-### CausalSelfAttention (class, line 89)
+### CausalSelfAttention (class, line 97)
 Multi-head attention with GQA, RoPE, QK norm, value residual (ResFormer), and Flash Attention 3 / SDPA fallback.
 
-### MLP (class, line 165)
+### MLP (class, line 175)
 Feedforward network: `Linear(n_embd, 4*n_embd)` -> `ReLU^2` -> `Linear(4*n_embd, n_embd)`. No bias.
 
-### Block (class, line 188)
+### Block (class, line 198)
 Pre-LN transformer block: `x + attn(norm(x))`, then `x + mlp(norm(x))`.
 
 ### Helper Functions
 | Function | Line | Description |
 |----------|------|-------------|
 | `norm(x)` | 42 | Parameterless RMS normalization via `F.rms_norm` |
-| `has_ve(layer_idx, n_layer)` | 60 | Returns True if layer should have value embedding (alternating pattern) |
-| `apply_rotary_emb(x, cos, sin)` | 64 | Applies RoPE by rotating pairs of dimensions |
+| `Linear` (class) | 60 | `nn.Linear` subclass that casts weights to the input dtype in forward (replaces autocast; master weights stay fp32) |
+| `has_ve(layer_idx, n_layer)` | 68 | Returns True if layer should have value embedding (alternating pattern) |
+| `apply_rotary_emb(x, cos, sin)` | 72 | Applies RoPE by rotating pairs of dimensions |
 
 ---
 
 ## Optimizers (`nanochat/optim.py`)
 
-### MuonAdamW (class, line 152)
+### MuonAdamW (class, line 154)
 Single-GPU combined optimizer. Uses **Muon** (Newton-Schulz orthogonalized momentum SGD) for 2D weight matrices and **AdamW** for everything else (embeddings, lm_head, scalars).
 
 Key algorithmic components:
 - **Polar Express** orthogonalization (5 iterations, replaces original Newton-Schulz)
 - **NorMuon variance reduction**: per-neuron adaptive LR normalization
 - **Cautious weight decay**: only decays weights that agree in sign with the gradient
-- **Nesterov momentum** with warmup from 0.85 to 0.95
+- **Nesterov momentum** with warmup from 0.85 to 0.97 (schedule set in `base_train.py`)
 - **Fused kernels** via `@torch.compile` for both AdamW and Muon steps
 
 | Method | Line | Description |
 |--------|------|-------------|
-| `adamw_step_fused` | 21 | Compiled fused AdamW: decay -> lerp moments -> bias correct -> update |
-| `muon_step_fused` | 91 | Compiled fused Muon: momentum -> polar_express -> variance_reduction -> cautious update |
-| `_step_adamw` | 194 | Per-param AdamW update with lazy state init |
-| `_step_muon` | 229 | Stacked Muon update (all same-shape params processed together) |
+| `adamw_step_fused` | 22 | Compiled fused AdamW: decay -> lerp moments -> bias correct -> update |
+| `muon_step_fused` | 92 | Compiled fused Muon: momentum -> polar_express -> variance_reduction -> cautious update |
+| `_step_adamw` | 196 | Per-param AdamW update with lazy state init |
+| `_step_muon` | 231 | Stacked Muon update (all same-shape params processed together) |
 
-### DistMuonAdamW (class, line 297)
+### DistMuonAdamW (class, line 299)
 Distributed version with ZeRO-2 style optimizer sharding. Uses a 3-phase async communication pattern:
 1. Launch all async reduce_scatter/all_reduce ops
 2. Wait for reduce, compute update, launch all_gather
@@ -85,39 +88,39 @@ Distributed version with ZeRO-2 style optimizer sharding. Uses a 3-phase async c
 
 ## Inference Engine (`nanochat/engine.py`)
 
-### KVCache (class, line 83)
+### KVCache (class, line 82)
 KV cache for Flash Attention 3's `flash_attn_with_kvcache` API. Tensors are `(B, T, H, D)` format.
 
 | Method | Line | Description |
 |--------|------|-------------|
-| `reset` | 105 | Zero out cache positions |
-| `get_pos` | 109 | Get current sequence position |
-| `get_layer_cache` | 113 | Return (k, v) cache views for a layer |
-| `advance` | 117 | Move position forward by N tokens |
-| `prefill` | 121 | Copy from another cache (for multi-sample generation) |
+| `reset` | 106 | Zero out cache positions |
+| `get_pos` | 111 | Get current sequence position |
+| `get_layer_cache` | 115 | Return (k, v) cache views for a layer |
+| `advance` | 119 | Move position forward by N tokens |
+| `prefill` | 123 | Copy from another cache (for multi-sample generation) |
 
-### Engine (class, line 164)
+### Engine (class, line 169)
 Efficient batched generation with KV cache and tool use (calculator).
 
 | Method | Line | Description |
 |--------|------|-------------|
-| `generate` | 171 | Streaming generation: batch=1 prefill, then clone KV cache for N samples. Handles tool use state machine (python_start/end, calculator eval, output injection). Yields `(token_column, token_masks)` per step. |
-| `generate_batch` | 277 | Non-streaming wrapper that collects all tokens into final sequences. |
+| `generate` | 176 | Streaming generation: batch=1 prefill, then clone KV cache for N samples. Handles tool use state machine (python_start/end, calculator eval, output injection). Yields `(token_column, token_masks)` per step. |
+| `generate_batch` | 282 | Non-streaming wrapper that collects all tokens into final sequences. |
 
-### sample_next_token (function, line 136)
+### sample_next_token (function, line 141)
 Samples from logits with temperature and top-k. Returns `(B, 1)` tensor.
 
 ### Calculator Tool Functions
 | Function | Line | Description |
 |----------|------|-------------|
-| `use_calculator` | 47 | Safely evaluates math expressions and `.count()` string operations |
-| `eval_with_timeout` | 36 | Evaluates expression with 3-second timeout |
+| `use_calculator` | 46 | Safely evaluates math expressions and `.count()` string operations |
+| `eval_with_timeout` | 35 | Evaluates expression with 3-second timeout |
 
 ---
 
 ## Data Loading (`nanochat/dataloader.py`)
 
-### tokenizing_distributed_data_loader_with_state_bos_bestfit (function, line 73)
+### tokenizing_distributed_data_loader_with_state_bos_bestfit (function, line 74)
 Primary dataloader for pretraining. BOS-aligned with best-fit document packing.
 
 **Algorithm per batch row:**
@@ -138,9 +141,9 @@ Unified interface that auto-selects FA3 on Hopper GPUs (sm90) and falls back to 
 
 | Function | Line | Description |
 |----------|------|-------------|
-| `flash_attn_func` | 99 | Training attention (no KV cache). Input: `(B, T, H, D)` |
-| `flash_attn_with_kvcache` | 123 | Inference attention with KV cache management |
-| `_sdpa_attention` | 61 | SDPA fallback with sliding window support via explicit masks |
+| `flash_attn_func` | 107 | Training attention (no KV cache). Input: `(B, T, H, D)` |
+| `flash_attn_with_kvcache` | 131 | Inference attention with KV cache management |
+| `_sdpa_attention` | 69 | SDPA fallback with sliding window support via explicit masks |
 
 ---
 
@@ -150,9 +153,9 @@ Minimal FP8 implementation (~150 lines vs torchao's ~2000 lines). Drop-in replac
 
 | Component | Line | Description |
 |-----------|------|-------------|
-| `_to_fp8` | 80 | Dynamic tensorwise quantization: compute scale, clamp, cast |
-| `_Float8Matmul` | 123 | Custom autograd: forward (e4m3fn), backward (e5m2 for grads) |
-| `Float8Linear` | 193 | Drop-in `nn.Linear` replacement |
+| `_to_fp8` | 82 | Dynamic tensorwise quantization: compute scale, clamp, cast |
+| `_Float8Matmul` | 125 | Custom autograd: forward (e4m3fn), backward (e5m2 for grads) |
+| `Float8Linear` | 195 | Drop-in `nn.Linear` replacement |
 | `convert_to_float8_training` | 243 | Module tree walker that swaps Linear -> Float8Linear |
 
 ---
@@ -202,8 +205,9 @@ Full pretraining pipeline with:
 - Auto-computed optimal batch size (Power Lines paper: B_opt proportional to D^0.383)
 - Scaling law-based training horizon (tokens = ratio * params)
 - WSD learning rate schedule (warmup -> stable -> warmdown)
-- Muon momentum warmup (0.85 -> 0.95 over 300 steps)
-- Linear weight decay rampdown to zero
+- Muon momentum schedule (0.85 -> 0.97 over 400 steps, then warmdown to 0.90 during LR warmdown)
+- Cosine weight decay rampdown to zero
+- Trains on the ClimbMix-400B dataset (upgraded from FineWeb-EDU-100B)
 - CORE metric evaluation, model sampling, wandb logging
 
 ### SFT (`scripts/chat_sft.py`)
@@ -230,7 +234,7 @@ Reinforcement learning on GSM8K math problems:
 | `common.py` | `TaskMixture`, `TaskSequence` | Task composition utilities |
 | `gsm8k.py` | `GSM8K` | Math word problems with `reward()` and `evaluate()` methods |
 | `arc.py` | `ARC` | Science multiple choice (Easy + Challenge) |
-| `mmlu.py` | `MMLU` | Massive Multitask Language Understanding |
+| `mmlu.py` | `MMLU` | Massive Multitask Language Understanding (single "all" subset; training data is the `auxiliary_train` split) |
 | `humaneval.py` | `HumanEval` | Code generation benchmark |
 | `spellingbee.py` | `SpellingBee`, `SimpleSpelling` | Character counting + spelling tasks with `reward()` |
 | `smoltalk.py` | `SmolTalk` | General conversation data |
