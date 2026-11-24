@@ -462,9 +462,5 @@ for step in range(num_steps):
         )
         print(f"Saved GRPO checkpoint to {checkpoint_dir}")
 
-# Log to report
-from nanochat.report import get_report
-get_report().log(section="Chat RL (GRPO)", data=[user_config])
-
 wandb_run.finish()
 compute_cleanup()
