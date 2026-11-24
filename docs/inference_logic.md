@@ -8,7 +8,7 @@ How nanochat generates text, from prompt to output tokens.
 
 Nanochat has two inference paths:
 
-1. **Naive generation** (`GPT.generate` in `nanochat/gpt.py:603`) - Simple autoregressive loop without KV cache. Batch size 1 only. Used for quick sampling during training evaluation.
+1. **Naive generation** (`GPT.generate` in `nanochat/gpt.py:603`) - Simple autoregressive loop without KV cache. Batch size 1 only. Used only as a reference implementation: the `__main__` block of `nanochat/engine.py` runs it next to `Engine.generate`, times both and compares the two token streams.
 
 2. **Engine generation** (`Engine.generate` in `nanochat/engine.py:176`) - Production inference with KV cache, batched multi-sample generation, and tool use (calculator). This is the primary inference path.
 
