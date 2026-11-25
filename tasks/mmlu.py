@@ -29,8 +29,7 @@ The dataset exposes a single "all" subset across all 57 subjects, with splits:
 - "validation" / "dev" / "test": Evaluation splits
 """
 
-from datasets import load_dataset
-from tasks.common import Task, render_mc
+from tasks.common import Task, load_hub_dataset, render_mc
 
 class MMLU(Task):
     """
@@ -75,8 +74,8 @@ class MMLU(Task):
         assert split in ["auxiliary_train", "validation", "dev", "test"], f"split {split} must be auxiliary_train|validation|dev|test"
         self.subset = subset
         self.split = split
-        # Load from HuggingFace and shuffle with fixed seed for reproducibility
-        self.ds = load_dataset("cais/mmlu", subset, split=split).shuffle(seed=42)
+        # Load the parquet export from the HuggingFace Hub (cached locally) and shuffle with fixed seed for reproducibility
+        self.ds = load_hub_dataset("cais/mmlu", subset, split=split).shuffle(seed=42)
 
     @property
     def eval_type(self):

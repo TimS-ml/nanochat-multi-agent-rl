@@ -26,8 +26,7 @@ Example question:
 Evaluation: Categorical (multiple choice) - model must output the correct letter.
 """
 
-from datasets import load_dataset
-from tasks.common import Task, render_mc
+from tasks.common import Task, load_hub_dataset, render_mc
 
 class ARC(Task):
     """
@@ -49,8 +48,8 @@ class ARC(Task):
         super().__init__(**kwargs)
         assert subset in ["ARC-Easy", "ARC-Challenge"], "ARC subset must be ARC-Easy or ARC-Challenge"
         assert split in ["train", "validation", "test"], "ARC split must be train|validation|test"
-        # Load from HuggingFace and shuffle with fixed seed for reproducibility
-        self.ds = load_dataset("allenai/ai2_arc", subset, split=split).shuffle(seed=42)
+        # Load the parquet export from the HuggingFace Hub (cached locally) and shuffle with fixed seed for reproducibility
+        self.ds = load_hub_dataset("allenai/ai2_arc", subset, split=split).shuffle(seed=42)
 
     @property
     def eval_type(self):

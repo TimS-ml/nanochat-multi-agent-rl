@@ -1,5 +1,5 @@
 """
-Dataset Management - Handling the base pre-training dataset (FineWeb-Edu).
+Dataset Management - Handling the base pre-training dataset (ClimbMix-400B).
 
 The pre-training dataset consists of Parquet files containing web text documents.
 This module provides utilities for:
@@ -9,15 +9,16 @@ This module provides utilities for:
 - Automatic retry logic with exponential backoff
 
 Dataset structure:
-- ~1800+ shards of Parquet files (shard_00000.parquet to shard_01822.parquet)
+- 6543 shards of Parquet files (shard_00000.parquet to shard_06542.parquet)
 - Each shard contains multiple row groups for efficient streaming
 - Last shard reserved for validation, others for training
 - Column format: {'text': string} - raw document text
 
-Data source: FineWeb-Edu 100BT subset
-- High-quality educational web text
-- Pre-filtered and deduplicated
+Data source: ClimbMix-400B
+- NVIDIA Nemotron-ClimbMix, shuffled and repackaged as karpathy/climbmix-400b-shuffle
 - Hosted on HuggingFace
+- Replaced the earlier FineWeb-Edu 100B dataset (list_parquet_files still falls back to an existing
+  legacy FineWeb-Edu directory when the ClimbMix directory is missing)
 
 For dataset preparation details, see `dev/repackage_data_reference.py`.
 """

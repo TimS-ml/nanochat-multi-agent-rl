@@ -8,7 +8,7 @@ How nanochat generates text, from prompt to output tokens.
 
 Nanochat has two inference paths:
 
-1. **Naive generation** (`GPT.generate` in `nanochat/gpt.py:560`) - Simple autoregressive loop without KV cache. Batch size 1 only. Used for quick sampling during training evaluation.
+1. **Naive generation** (`GPT.generate` in `nanochat/gpt.py:603`) - Simple autoregressive loop without KV cache. Batch size 1 only. Used only as a reference implementation: the `__main__` block of `nanochat/engine.py` runs it next to `Engine.generate`, times both and compares the two token streams.
 
 2. **Engine generation** (`Engine.generate` in `nanochat/engine.py:176`) - Production inference with KV cache, batched multi-sample generation, and tool use (calculator). This is the primary inference path.
 
@@ -135,7 +135,11 @@ Key differences from FA2-style caches:
 - FA3 updates cache **in-place** during `flash_attn_with_kvcache`
 - Position tracked per batch element via `cache_seqlens`
 
-### Cache Flow in Attention (`gpt.py:154-167`)
+### Cache dtype
+
+`Engine.generate` allocates the cache in `COMPUTE_DTYPE`, the dtype the forward pass emits: bf16 on CUDA GPUs with compute capability 8.0+, fp32 otherwise (CPU, MPS, pre-Ampere GPUs), overridable with the `NANOCHAT_DTYPE` environment variable (for example `NANOCHAT_DTYPE=bfloat16` on MPS). bf16 halves the cache bytes relative to fp32.
+
+### Cache Flow in Attention (`gpt.py:154-169`)
 
 **Training** (no cache):
 ```python
@@ -173,9 +177,9 @@ Layer 4: S (512 tokens)
 Layer N: L (2048 tokens)  <- final layer, always full context
 ```
 
-Window sizes are stored as `(left, right)` tuples for FA3:
-- `(-1, 0)` = full causal context (unlimited left)
-- `(512, 0)` = sliding window of 512 tokens
+Window sizes are stored as `(left, right)` tuples for FA3 (`GPT._compute_window_sizes`, kept in `GPT.window_sizes`):
+- L layers: `(sequence_len, 0)`, e.g. `(2048, 0)` = the full causal context (FA3 itself also accepts `-1` for "unlimited left")
+- S layers: `(512, 0)` = sliding window of 512 tokens
 
 ---
 
@@ -194,7 +198,7 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 The function operates on batched logits `(B, vocab_size)` and returns `(B, 1)`.
 
-### Logit Processing in Model (`gpt.py:544-548`)
+### Logit Processing in Model (`gpt.py:586-591`)
 
 Before sampling, logits go through:
 1. **Padding removal**: Slice to actual `vocab_size` (model pads to multiple of 64)
@@ -206,7 +210,7 @@ Before sampling, logits go through:
 ## Generation Modes
 
 ### Streaming (`Engine.generate`)
-Yields `(token_column, token_masks)` per step. Used by CLI and web interfaces.
+Yields `(token_column, token_masks)` per step. Used by the CLI (`scripts/chat_cli.py`) and by the inference benchmark (`scripts/infer_bench.py`).
 
 ```python
 for token_column, token_masks in engine.generate(tokens, num_samples=4, ...):
@@ -226,6 +230,43 @@ results, masks = engine.generate_batch(tokens, num_samples=16, max_tokens=256)
 
 ### Naive (`GPT.generate`)
 Simple streaming generator without KV cache. Batch=1 only. Re-processes entire sequence each step (quadratic cost). Used only for testing/comparison.
+
+---
+
+## Inference Cost Model and Benchmark
+
+Inference has two regimes. **Prefill** processes the whole prompt in parallel with large matmuls, so it is compute-bound. **Decode** emits one token per step and re-reads all weights and the KV cache to do little math, so it is memory-bandwidth-bound, and batching is nearly free until compute saturates. `GPT` carries the architecture-side accounting for both regimes, and `scripts/infer_bench.py` measures how close a real run comes to the hardware limits.
+
+Notation: $P$ is the number of matmul params (`GPT.num_matmul_params`), $h$ the number of query heads, $q$ the head dimension, $h_{kv}$ the number of KV heads, $L$ the number of layers, $w_\ell$ the window of layer $\ell$ (from `GPT.window_sizes`), and $b$ the bytes per element of `COMPUTE_DTYPE`.
+
+### Architecture-side accounting (`nanochat/gpt.py`)
+
+Attention at one query position over $m$ keys costs $2hqm$ FLOPs for $QK^\top$ plus $2hqm$ for the weighted sum over $V$, i.e. $4hqm$. Each matmul param costs 2 FLOPs per token (one multiply, one add). Layer $\ell$ attends to at most $w_\ell$ tokens, so:
+
+| Method | Quantity | Formula |
+|--------|----------|---------|
+| `estimate_decode_flops(c)` | Forward FLOPs to decode one token at context length $c$ | $2P + \sum_{\ell=1}^{L} 4hq\,\min(c, w_\ell)$ |
+| `estimate_prefill_flops(T)` | Forward FLOPs to prefill $T$ prompt tokens | $2PT + \sum_{\ell=1}^{L} 4hq\,A_\ell$, with $A_\ell = \frac{w(w+1)}{2} + (T-w)\,w$ and $w = \min(w_\ell, T)$ |
+| `kv_bytes_per_token()` | KV bytes stored per token per row | $L \cdot 2 \cdot h_{kv} \cdot q \cdot b$ |
+| `kv_read_bytes(c)` | KV bytes read by one decode step at context length $c$ | $\sum_{\ell=1}^{L} 2\,h_{kv}\,q\,b\,\min(c, w_\ell)$ |
+
+$A_\ell$ counts the (query, key) pairs of causal attention with a window: the first $w$ tokens attend to $1, 2, \dots, w$ tokens, which sums to $w(w+1)/2$, and each of the remaining $T-w$ tokens attends to exactly $w$ tokens. The factor 2 in the KV formulas is one K and one V tensor.
+
+### Measurement (`scripts/infer_bench.py`)
+
+CUDA only, single GPU: `python -m scripts.infer_bench -i base -g d12`. Let $W$ be the weight bytes as stored (`sum(p.numel() * p.element_size())`), $c_{mid}$ the representative decode context (prompt length plus half the decode tokens), $R$ the KV bytes read per row at that context (`kv_read_bytes`), $n$ the decode batch size, $t$ the median decode step time, $\mathrm{BW}$ the peak memory bandwidth and $F$ the peak FLOP/s of the GPU (`get_peak_bandwidth` and `get_peak_flops` in `nanochat/common.py`; unknown GPUs yield infinity, which shows as 0%).
+
+| Metric | Definition |
+|--------|------------|
+| TTFT | Time of the first `next()` on `Engine.generate`: batch=1 prefill, KV cache replication to $n$ rows, and sampling of the first token |
+| TPOT | $t$, the median time of one decode step for all $n$ rows |
+| Throughput | $n \cdot (\text{decode steps}) / \sum(\text{step times})$ tokens/s |
+| Batch-1 ceiling | Every step must re-read the weights and the KV cache, so a step takes at least $(W+R)/\mathrm{BW}$ seconds, giving at most $\mathrm{BW}/(W+R)$ tokens/s |
+| MBU (model bandwidth utilization) | $\dfrac{(W + nR)/t}{\mathrm{BW}}$, the decode counterpart of training MFU. It binds at small $n$ |
+| Decode MFU | $\dfrac{n \cdot \texttt{estimate\_decode\_flops}(c_{mid})/t}{F}$. It binds at large $n$ |
+| Prefill MFU | $\dfrac{\texttt{estimate\_prefill\_flops}(T)/t_{prefill}}{F}$, measured at batch 1, with $t_{prefill}$ the TTFT of a generation capped at 2 tokens |
+
+The script prints a static card (weights, KV bytes per token, ceilings), the prefill line, and a table over `--batch-sizes` (default 1,8,32,128). The last line of stdout is the same data as one JSON document, so other scripts can read it with `json.loads(stdout.splitlines()[-1])`.
 
 ---
 

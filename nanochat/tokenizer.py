@@ -1,9 +1,5 @@
 """
-BPE Tokenizer in the style of GPT-4.
-
-Two implementations are available:
-1) HuggingFace Tokenizer that can do both training and inference but is really confusing
-2) Our own RustBPE Tokenizer for training and tiktoken for efficient inference
+BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken.
 """
 
 import os
@@ -30,228 +26,6 @@ SPECIAL_TOKENS = [
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 # -----------------------------------------------------------------------------
-# Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
-from tokenizers import Tokenizer as HFTokenizer
-from tokenizers import pre_tokenizers, decoders, Regex
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-
-class HuggingFaceTokenizer:
-    """
-    Light wrapper around HuggingFace Tokenizer providing a unified interface.
-
-    This class wraps the HuggingFace Tokenizers library to provide consistent
-    methods for training, encoding, decoding, and managing BPE tokenizers.
-    """
-
-    def __init__(self, tokenizer):
-        """
-        Initialize the tokenizer wrapper.
-
-        Args:
-            tokenizer: An instance of HuggingFace Tokenizer
-        """
-        self.tokenizer = tokenizer
-
-    @classmethod
-    def from_pretrained(cls, hf_path):
-        """
-        Load a tokenizer from HuggingFace's model hub.
-
-        Args:
-            hf_path: HuggingFace model identifier (e.g. "gpt2")
-
-        Returns:
-            HuggingFaceTokenizer instance
-        """
-        tokenizer = HFTokenizer.from_pretrained(hf_path)
-        return cls(tokenizer)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir):
-        """
-        Load a tokenizer from a local directory.
-
-        Args:
-            tokenizer_dir: Path to directory containing tokenizer.json
-
-        Returns:
-            HuggingFaceTokenizer instance
-        """
-        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-        tokenizer = HFTokenizer.from_file(tokenizer_path)
-        return cls(tokenizer)
-
-    @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
-        """
-        Train a new BPE tokenizer from scratch using an iterator of text.
-
-        This method configures and trains a GPT-4 style tokenizer with:
-        - Byte-level BPE encoding (ensures all text can be represented)
-        - GPT-4 regex splitting pattern
-        - No normalization (preserves original text)
-        - Special tokens for conversation formatting
-
-        Args:
-            text_iterator: Iterator yielding strings of text to train on
-            vocab_size: Target vocabulary size (includes special tokens)
-
-        Returns:
-            HuggingFaceTokenizer instance with trained tokenizer
-        """
-        # Configure the HuggingFace Tokenizer with byte-level BPE
-        # byte_fallback=True ensures every byte can be represented, preventing UNK tokens
-        tokenizer = HFTokenizer(BPE(
-            byte_fallback=True, # needed to handle any byte sequence
-            unk_token=None,
-            fuse_unk=False,
-        ))
-        # Normalizer: None - we don't want to modify the input text (no lowercasing, etc.)
-        tokenizer.normalizer = None
-        # Pre-tokenizer: GPT-4 style regex-based splitting
-        # This regex splits text into chunks before applying BPE merges
-        # NOTE: The pattern was changed from \p{N}{1,3} to \p{N}{1,2} because I suspect it is harmful to
-        # very small models and smaller vocab sizes, because it is a little bit wasteful in the token space.
-        # (but I haven't validated this! TODO)
-        gpt4_split_regex = Regex(SPLIT_PATTERN) # huggingface demands that you wrap it in Regex!!
-        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-            # First split by the regex pattern to isolate different text categories
-            pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False),
-            # Then apply byte-level encoding to handle all Unicode properly
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
-        ])
-        # Decoder: ByteLevel (it pairs together with the ByteLevel pre-tokenizer)
-        tokenizer.decoder = decoders.ByteLevel()
-        # Post-processor: None - no additional processing after tokenization
-        tokenizer.post_processor = None
-        # Trainer: BPE configuration
-        trainer = BpeTrainer(
-            vocab_size=vocab_size,
-            show_progress=True,
-            min_frequency=0, # no minimum frequency requirement for merges
-            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), # start with all possible bytes
-            special_tokens=SPECIAL_TOKENS, # add conversation special tokens
-        )
-        # Kick off the training process
-        tokenizer.train_from_iterator(text_iterator, trainer)
-        return cls(tokenizer)
-
-    def get_vocab_size(self):
-        """Get the total vocabulary size including special tokens."""
-        return self.tokenizer.get_vocab_size()
-
-    def get_special_tokens(self):
-        """
-        Get list of all special tokens in the vocabulary.
-
-        Returns:
-            List of special token strings
-        """
-        special_tokens_map = self.tokenizer.get_added_tokens_decoder()
-        special_tokens = [w.content for w in special_tokens_map.values()]
-        return special_tokens
-
-    def id_to_token(self, id):
-        """
-        Convert a token ID to its string representation.
-
-        Args:
-            id: Token ID (integer)
-
-        Returns:
-            String representation of the token
-        """
-        return self.tokenizer.id_to_token(id)
-
-    def _encode_one(self, text, prepend=None, append=None, num_threads=None):
-        # encode a single string
-        # prepend/append can be either a string of a special token or a token id directly.
-        # num_threads is ignored (only used by the nanochat Tokenizer for parallel encoding)
-        assert isinstance(text, str)
-        ids = []
-        # Add prepend token if specified
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
-            ids.append(prepend_id)
-        # Encode the main text without automatic special tokens
-        ids.extend(self.tokenizer.encode(text, add_special_tokens=False).ids)
-        # Add append token if specified
-        if append is not None:
-            append_id = append if isinstance(append, int) else self.encode_special(append)
-            ids.append(append_id)
-        return ids
-
-    def encode_special(self, text):
-        """
-        Encode a single special token via exact string match.
-
-        Args:
-            text: Special token string (e.g. "<|bos|>")
-
-        Returns:
-            Token ID for the special token
-        """
-        return self.tokenizer.token_to_id(text)
-
-    def get_bos_token_id(self):
-        # Different HuggingFace models use different BOS tokens and there is little consistency
-        # 1) attempt to find a <|bos|> token
-        bos = self.encode_special("<|bos|>")
-        # 2) if that fails, attempt to find a <|endoftext|> token (e.g. GPT-2 models)
-        if bos is None:
-            bos = self.encode_special("<|endoftext|>")
-        # 3) if these fail, it's better to crash than to silently return None
-        assert bos is not None, "Failed to find BOS token in tokenizer"
-        return bos
-
-    def encode(self, text, *args, **kwargs):
-        """
-        Encode text to token IDs. Handles both single strings and lists of strings.
-
-        Args:
-            text: String or list of strings to encode
-            *args, **kwargs: Additional arguments passed to _encode_one
-
-        Returns:
-            List of token IDs (if text is string) or list of lists (if text is list)
-        """
-        if isinstance(text, str):
-            return self._encode_one(text, *args, **kwargs)
-        elif isinstance(text, list):
-            return [self._encode_one(t, *args, **kwargs) for t in text]
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-
-    def __call__(self, *args, **kwargs):
-        """Allow calling the tokenizer instance directly like a function."""
-        return self.encode(*args, **kwargs)
-
-    def decode(self, ids):
-        """
-        Decode token IDs back to text.
-
-        Args:
-            ids: List of token IDs
-
-        Returns:
-            Decoded string (includes special tokens)
-        """
-        return self.tokenizer.decode(ids, skip_special_tokens=False)
-
-    def save(self, tokenizer_dir):
-        """
-        Save the tokenizer to disk.
-
-        Args:
-            tokenizer_dir: Directory path to save tokenizer.json
-        """
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-        self.tokenizer.save(tokenizer_path)
-        print(f"Saved tokenizer to {tokenizer_path}")
-
-# -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
 import rustbpe
@@ -261,9 +35,8 @@ class RustBPETokenizer:
     """
     Tokenizer using rustbpe for training and tiktoken for efficient inference.
 
-    This implementation provides faster training with rustbpe and faster encoding
-    with tiktoken compared to the HuggingFace implementation. It's the recommended
-    tokenizer for production use in nanochat.
+    rustbpe provides fast BPE training and tiktoken provides fast encoding and decoding.
+    This is nanochat's only tokenizer implementation.
     """
 
     def __init__(self, enc, bos_token):
@@ -470,6 +243,22 @@ class RustBPETokenizer:
         """
         return self.enc.decode(ids)
 
+    def decode_single_token_bytes(self, token_id):
+        """
+        Return the raw bytes of a single token.
+
+        Unlike decode(), this does not round-trip through str, so a token that is not valid
+        standalone UTF-8 (e.g. one half of a multi-byte character) keeps its exact byte length.
+        scripts/tok_train.py uses it to build the token_bytes table for bits-per-byte.
+
+        Args:
+            token_id: Token ID (integer)
+
+        Returns:
+            bytes object for that token
+        """
+        return self.enc.decode_single_token_bytes(token_id)
+
     def save(self, tokenizer_dir):
         """
         Save the tokenizer encoding to disk as a pickle file.
@@ -673,7 +462,6 @@ def get_tokenizer():
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):

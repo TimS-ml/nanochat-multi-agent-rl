@@ -31,8 +31,7 @@ This is a key dataset for making models conversational and useful in open-ended
 dialogue, as opposed to just being good at specific benchmarks.
 """
 
-from datasets import load_dataset
-from tasks.common import Task
+from tasks.common import Task, load_hub_dataset
 
 class SmolTalk(Task):
     """
@@ -55,8 +54,8 @@ class SmolTalk(Task):
         """
         super().__init__(**kwargs)
         assert split in ["train", "test"], "SmolTalk split must be train|test"
-        # Load from HuggingFace and shuffle for variety during training
-        self.ds = load_dataset("HuggingFaceTB/smol-smoltalk", split=split).shuffle(seed=42)
+        # Load the parquet export from the HuggingFace Hub (cached locally) and shuffle for variety during training
+        self.ds = load_hub_dataset("HuggingFaceTB/smol-smoltalk", split=split).shuffle(seed=42)
         self.length = len(self.ds)
 
     def num_examples(self):

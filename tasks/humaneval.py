@@ -36,9 +36,8 @@ The standard metric is pass@k (percentage of problems solved with k samples).
 """
 
 import re
-from datasets import load_dataset
 from nanochat.execution import execute_code
-from tasks.common import Task
+from tasks.common import Task, load_hub_dataset
 
 def extract_imports(prompt):
     """
@@ -127,8 +126,9 @@ class HumanEval(Task):
         Note: HumanEval only has a test split (164 problems), no train/validation.
         """
         super().__init__(**kwargs)
-        # Load the dataset and shuffle for variety
-        self.ds = load_dataset("openai/openai_humaneval", split="test").shuffle(seed=42)
+        # Load the parquet export from the HuggingFace Hub (cached locally) and shuffle for variety
+        # note: this dataset has no named subsets, its parquet config on the hub is "openai_humaneval"
+        self.ds = load_hub_dataset("openai/openai_humaneval", subset="openai_humaneval", split="test").shuffle(seed=42)
 
     @property
     def eval_type(self):

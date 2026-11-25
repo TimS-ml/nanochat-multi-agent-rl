@@ -39,8 +39,7 @@ Evaluation: Generative - extract final numeric answer and compare for exact matc
 """
 
 import re
-from datasets import load_dataset
-from tasks.common import Task
+from tasks.common import Task, load_hub_dataset
 
 
 # Regex pattern to extract the final answer after the #### marker
@@ -100,8 +99,8 @@ class GSM8K(Task):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
-        # Load from HuggingFace and shuffle for variety
-        self.ds = load_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
+        # Load the parquet export from the HuggingFace Hub (cached locally) and shuffle for variety
+        self.ds = load_hub_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
 
     @property
     def eval_type(self):
